@@ -4,6 +4,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 NODE="${NODE:-/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node}"
 [ -x "$NODE" ] || { printf 'Codex bundled Node.js was not found: %s\n' "$NODE" >&2; exit 1; }
+EXPECTED_VERSION="$(/usr/bin/tr -d '[:space:]' < "$ROOT/VERSION")"
+PACKAGE_VERSION="$("$NODE" -p 'require(process.argv[1]).version' "$ROOT/package.json")"
+[ "$PACKAGE_VERSION" = "$EXPECTED_VERSION" ] || {
+  printf 'package.json version %s does not match VERSION %s.\n' "$PACKAGE_VERSION" "$EXPECTED_VERSION" >&2
+  exit 1
+}
 
 while IFS= read -r file; do /bin/bash -n "$file"; done < <(
   /usr/bin/find "$ROOT" -type f \( -name '*.sh' -o -name '*.command' \) \
@@ -27,11 +33,29 @@ if /usr/bin/grep -n -E '/usr/bin/python3|(^|[[:space:]])eval([[:space:]]|$)' \
   printf 'The shared macOS runtime must parse state with the bundled Node.js, without python3 or eval.\n' >&2
   exit 1
 fi
+if /usr/bin/grep -n -E 'verified_cdp_endpoint[^|]*\|\|[[:space:]]*cdp_http_ready|\*ChatGPT\*\|\*Codex\*\|\*codex\*' \
+  "$ROOT/scripts/common-macos.sh" >/dev/null; then
+  printf 'The macOS runtime contains a soft CDP identity bypass.\n' >&2
+  exit 1
+fi
+if /usr/bin/grep -n -F 'Input.dispatchKeyEvent' "$ROOT/scripts/injector.mjs" >/dev/null; then
+  printf 'Screenshot capture must not dispatch keyboard input.\n' >&2
+  exit 1
+fi
 
 "$NODE" "$ROOT/scripts/injector.mjs" --check-payload >/dev/null
+"$NODE" "$ROOT/scripts/injector.mjs" --self-test >/dev/null
 
 TMP="$(/usr/bin/mktemp -d /tmp/codex-dream-skin-tests.XXXXXX)"
-trap '/bin/rm -rf "$TMP"' EXIT
+STRANGER_PID=""
+cleanup() {
+  if [ -n "$STRANGER_PID" ]; then
+    /bin/kill -TERM "$STRANGER_PID" 2>/dev/null || true
+    wait "$STRANGER_PID" 2>/dev/null || true
+  fi
+  /bin/rm -rf "$TMP"
+}
+trap cleanup EXIT
 
 RUNTIME_HOME="$TMP/runtime-home"
 RUNTIME_STATE_ROOT="$RUNTIME_HOME/Library/Application Support/CodexDreamSkinStudio"
@@ -39,26 +63,120 @@ RUNTIME_STATE="$RUNTIME_STATE_ROOT/state.json"
 STATE_EVAL_MARKER="$TMP/state-eval-marker"
 EXPECTED_BUNDLE="/Applications/Codex \$(touch \"$STATE_EVAL_MARKER\").app"
 EXPECTED_EXE="$EXPECTED_BUNDLE/Contents/MacOS/ChatGPT; touch \"$STATE_EVAL_MARKER\""
-EXPECTED_VERSION='1.1.2 "nightly"'
-EXPECTED_TEAM_ID="TEAM'ID"
+MALICIOUS_VERSION='1.1.2 "nightly"'
+MALICIOUS_TEAM_ID="TEAM'ID"
 /bin/mkdir -p "$RUNTIME_STATE_ROOT"
 "$NODE" -e '
   const fs = require("node:fs");
   const [file, codexBundle, codexExe, codexVersion, codexTeamId] = process.argv.slice(1);
   fs.writeFileSync(file, `${JSON.stringify({ codexBundle, codexExe, codexVersion, codexTeamId })}\n`);
-' "$RUNTIME_STATE" "$EXPECTED_BUNDLE" "$EXPECTED_EXE" "$EXPECTED_VERSION" "$EXPECTED_TEAM_ID"
-/usr/bin/env -u NODE -u NODE_VERSION HOME="$RUNTIME_HOME" /bin/bash -c '
+' "$RUNTIME_STATE" "$EXPECTED_BUNDLE" "$EXPECTED_EXE" "$MALICIOUS_VERSION" "$MALICIOUS_TEAM_ID"
+/usr/bin/env HOME="$RUNTIME_HOME" NODE="$TMP/untrusted-node" /bin/bash -c '
   . "$1/scripts/common-macos.sh"
+  TRUSTED_NODE="$2"
+  VALIDATION_MARKER="$3"
+  discover_codex_app() {
+    CODEX_BUNDLE="/Applications/Codex.app"
+    CODEX_EXE="/Applications/Codex.app/Contents/MacOS/ChatGPT"
+    CODEX_VERSION="test"
+    printf "discover\n" >> "$VALIDATION_MARKER"
+  }
+  require_macos_node_runtime() {
+    NODE="$TRUSTED_NODE"
+    NODE_VERSION="v22.0.0"
+    CODEX_TEAM_ID="2DC432GLL2"
+    export NODE NODE_VERSION CODEX_TEAM_ID
+    printf "validate\n" >> "$VALIDATION_MARKER"
+  }
   ensure_node_runtime
-  [ "$CODEX_BUNDLE" = "$2" ]
-  [ "$CODEX_EXE" = "$3" ]
-  [ "$CODEX_VERSION" = "$4" ]
-  [ "$CODEX_TEAM_ID" = "$5" ]
-' _ "$ROOT" "$EXPECTED_BUNDLE" "$EXPECTED_EXE" "$EXPECTED_VERSION" "$EXPECTED_TEAM_ID"
+  [ "$NODE" = "$TRUSTED_NODE" ]
+' _ "$ROOT" "$NODE" "$TMP/runtime-validation"
+/usr/bin/grep -q '^discover$' "$TMP/runtime-validation"
+/usr/bin/grep -q '^validate$' "$TMP/runtime-validation"
 [ ! -e "$STATE_EVAL_MARKER" ] || {
   printf 'Runtime state values were evaluated as shell code.\n' >&2
   exit 1
 }
+
+HOME="$RUNTIME_HOME" /bin/bash -c '
+  . "$1/scripts/common-macos.sh"
+  verified_cdp_endpoint() { return 1; }
+  if wait_for_cdp 9341 1; then
+    printf "An unverified CDP endpoint was accepted.\n" >&2
+    exit 1
+  fi
+' _ "$ROOT"
+HOME="$RUNTIME_HOME" /bin/bash -c '
+  . "$1/scripts/common-macos.sh"
+  CODEX_EXE="/bin/bash"
+  listener_pids() { printf "%s\n" "$$"; }
+  port_belongs_to_codex 9341
+  process_executable_path() { printf "/bin/zsh\n"; }
+  ! port_belongs_to_codex 9341
+
+  CODEX_EXE="/Applications/Codex.app/Contents/MacOS/ChatGPT"
+  listener_pids() { printf "999999\n"; }
+  pid_is_codex_descendant() { return 0; }
+  port_belongs_to_codex 9341
+  pid_is_codex_descendant() { return 1; }
+  ! port_belongs_to_codex 9341
+' _ "$ROOT"
+
+STRANGER_PID="$("$NODE" -e '
+  const { spawn } = require("node:child_process");
+  const child = spawn("/bin/sleep", ["30"], { detached: true, stdio: "ignore" });
+  child.unref();
+  process.stdout.write(String(child.pid));
+')"
+"$NODE" -e '
+  const fs = require("node:fs");
+  fs.writeFileSync(process.argv[1], JSON.stringify({ injectorPid: Number(process.argv[2]) }));
+' "$RUNTIME_STATE" "$STRANGER_PID"
+HOME="$RUNTIME_HOME" NODE="$NODE" /bin/bash -c '
+  . "$1/scripts/common-macos.sh"
+  stop_recorded_injector
+' _ "$ROOT"
+/bin/kill -0 "$STRANGER_PID"
+/bin/kill -TERM "$STRANGER_PID"
+STRANGER_PID=""
+
+WATCH_FIXTURE_DIR="$TMP/watch fixture"
+WATCH_FIXTURE="$WATCH_FIXTURE_DIR/injector.mjs"
+WATCH_PORT=49341
+/bin/mkdir -p "$WATCH_FIXTURE_DIR"
+/usr/bin/printf '%s\n' 'setInterval(() => {}, 1000);' > "$WATCH_FIXTURE"
+STRANGER_PID="$("$NODE" -e '
+  const { spawn } = require("node:child_process");
+  const [node, script, port] = process.argv.slice(1);
+  const child = spawn(node, [script, "--watch", "--port", port], { detached: true, stdio: "ignore" });
+  child.unref();
+  process.stdout.write(String(child.pid));
+' "$NODE" "$WATCH_FIXTURE" "$WATCH_PORT")"
+WATCH_STARTED_AT=""
+for _ in 1 2 3 4 5; do
+  WATCH_STARTED_AT="$(/bin/ps -p "$STRANGER_PID" -o lstart= 2>/dev/null | /usr/bin/awk '{$1=$1; print}')"
+  [ -n "$WATCH_STARTED_AT" ] && break
+  /bin/sleep 0.1
+done
+[ -n "$WATCH_STARTED_AT" ]
+"$NODE" -e '
+  const fs = require("node:fs");
+  const [file, pid, startedAt, nodePath, injectorPath, port] = process.argv.slice(1);
+  fs.writeFileSync(file, JSON.stringify({
+    injectorPid: Number(pid), injectorStartedAt: startedAt, nodePath, injectorPath, port: Number(port),
+  }));
+' "$RUNTIME_STATE" "$STRANGER_PID" "$WATCH_STARTED_AT" "$NODE" "$WATCH_FIXTURE" "$WATCH_PORT"
+HOME="$RUNTIME_HOME" NODE="$NODE" /bin/bash -c '
+  . "$1/scripts/common-macos.sh"
+  INJECTOR="$2"
+  INJECTOR_JOB_LABEL="com.openai.codex-dream-skin-studio.test.$3"
+  stop_recorded_injector
+' _ "$ROOT" "$WATCH_FIXTURE" "$$"
+if /bin/kill -0 "$STRANGER_PID" 2>/dev/null; then
+  printf 'A fully verified injector fixture was not stopped.\n' >&2
+  exit 1
+fi
+STRANGER_PID=""
 
 /bin/mkdir -p "$TMP/theme"
 /bin/cp "$ROOT/assets/portal-hero.png" "$TMP/theme/background.png"
@@ -101,7 +219,7 @@ NO_DESKTOP_BACKUP="$TMP/theme-backup-without-desktop.json"
 "$NODE" "$ROOT/scripts/theme-config.mjs" restore "$NO_DESKTOP_CONFIG" "$NO_DESKTOP_BACKUP" >/dev/null
 /usr/bin/cmp -s "$NO_DESKTOP_CONFIG" "$TMP/original-without-desktop.toml"
 
-/usr/bin/env -u HOME /bin/bash -c '. "$1/scripts/common-macos.sh"; [ -n "$HOME" ] && [ "$SKIN_VERSION" = "1.1.2" ]' _ "$ROOT"
+/usr/bin/env -u HOME /bin/bash -c '. "$1/scripts/common-macos.sh"; [ -n "$HOME" ] && [ "$SKIN_VERSION" = "$2" ]' _ "$ROOT" "$EXPECTED_VERSION"
 "$ROOT/scripts/doctor-macos.sh" >/dev/null
 
-printf 'PASS: syntax, payload, runtime-state safety, custom-theme, config round-trips, HOME recovery, signature, and doctor checks.\n'
+printf 'PASS: syntax, payload, CDP identity, PID safety, runtime validation, custom-theme, config round-trips, version, signature, and doctor checks.\n'

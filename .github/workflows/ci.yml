@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  static-and-node:
+    name: Static and Node checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Run cross-platform checks
+        run: .github/scripts/ci-static-checks.sh
+
+  windows-powershell:
+    name: Windows PowerShell checks
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Parse PowerShell scripts
+        shell: powershell
+        run: |
+          $failed = $false
+          Get-ChildItem windows -Recurse -Filter *.ps1 | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName,
+              [ref]$tokens,
+              [ref]$errors
+            ) | Out-Null
+            foreach ($error in $errors) {
+              Write-Error "$($_.FullName):$($error.Extent.StartLineNumber): $($error.Message)" -ErrorAction Continue
+              $failed = $true
+            }
+          }
+          if ($failed) { exit 1 }
+      - name: Run Windows Node regression checks
+        shell: powershell
+        run: |
+          node windows/scripts/injector.mjs --self-test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node windows/scripts/injector.mjs --check-payload
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node windows/tests/renderer-inject.test.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -4,7 +4,10 @@ import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
-const SKIN_VERSION = "1.1.2";
+const SKIN_VERSION = (await fs.readFile(path.join(root, "VERSION"), "utf8")).trim();
+if (!/^\d+\.\d+\.\d+$/.test(SKIN_VERSION)) {
+  throw new Error(`Invalid macOS VERSION value: ${SKIN_VERSION}`);
+}
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
 const MAX_ART_BYTES = 16 * 1024 * 1024;
 
@@ -25,6 +28,7 @@ function parseArgs(argv) {
     else if (arg === "--verify") options.mode = "verify";
     else if (arg === "--remove") options.mode = "remove";
     else if (arg === "--check-payload") options.mode = "check";
+    else if (arg === "--self-test") options.mode = "self-test";
     else if (arg === "--timeout-ms") options.timeoutMs = Number(argv[++i]);
     else if (arg === "--screenshot") options.screenshot = path.resolve(argv[++i]);
     else if (arg === "--theme-dir") options.themeDir = path.resolve(argv[++i]);
@@ -38,6 +42,15 @@ function parseArgs(argv) {
     throw new Error(`Invalid timeout: ${options.timeoutMs}`);
   }
   return options;
+}
+
+function parseCdpMessage(data) {
+  try {
+    const message = JSON.parse(String(data));
+    return message && typeof message === "object" ? message : null;
+  } catch {
+    return null;
+  }
 }
 
 function validatedDebuggerUrl(target, port) {
@@ -79,7 +92,8 @@ class CdpSession {
   }
 
   onMessage(event) {
-    const message = JSON.parse(String(event.data));
+    const message = parseCdpMessage(event.data);
+    if (!message) return;
     if (message.id) {
       const waiter = this.pending.get(message.id);
       if (!waiter) return;
@@ -386,22 +400,22 @@ async function waitForVerifiedSession(session, timeoutMs) {
 
 async function capture(session, outputPath) {
   await fs.mkdir(path.dirname(outputPath), { recursive: true });
-  await session.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
-  await session.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
-  const viewport = await session.evaluate("({ width: innerWidth, height: innerHeight })");
-  await session.send("Input.dispatchMouseEvent", {
-    type: "mouseMoved",
-    x: Math.round(viewport.width * 0.64),
-    y: Math.round(viewport.height * 0.62),
-    button: "none",
-  });
-  await new Promise((resolve) => setTimeout(resolve, 300));
   const result = await session.send("Page.captureScreenshot", {
     format: "png",
     fromSurface: true,
     captureBeyondViewport: false,
   });
   await fs.writeFile(outputPath, Buffer.from(result.data, "base64"));
+}
+
+function runSelfTest() {
+  const valid = parseCdpMessage('{"id":7,"result":{"ok":true}}');
+  if (valid?.id !== 7 || valid.result?.ok !== true) throw new Error("Valid CDP message parsing failed");
+  if (parseCdpMessage("{not-json") !== null) throw new Error("Malformed CDP message was accepted");
+  if (/dispatchKeyEvent|dispatchMouseEvent/.test(capture.toString())) {
+    throw new Error("Screenshot capture must not dispatch renderer input events");
+  }
+  console.log(JSON.stringify({ pass: true, version: SKIN_VERSION, test: "injector-resilience" }));
 }
 
 async function runOneShot(options) {
@@ -504,7 +518,8 @@ async function runWatch(options) {
 
 try {
   const options = parseArgs(process.argv.slice(2));
-  if (options.mode === "check") {
+  if (options.mode === "self-test") runSelfTest();
+  else if (options.mode === "check") {
     const loaded = await loadPayload(options.themeDir);
     console.log(JSON.stringify({
       pass: true,

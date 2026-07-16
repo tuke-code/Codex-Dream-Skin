@@ -24,6 +24,7 @@ This file is an optional Codex capability entry. The delivery is a complete stan
 - Keep decoration at `pointer-events: none`.
 - Require explicit authorization before restarting an already-running Codex instance.
 - Stop an injector only when its recorded PID, executable, command line, and start time all match.
+- `--watch` tracks Codex page and target lifecycles, not arbitrary theme-file edits. Use the provided customize and theme-switch commands so they can reload the payload safely.
 
 ## Key resources
 

@@ -58,12 +58,7 @@ if [ "$DEBUG_READY" = "false" ]; then
   # Some builds open the window slowly; also try activating the app once.
   /usr/bin/open -na "$CODEX_BUNDLE" --args --remote-debugging-address=127.0.0.1 --remote-debugging-port="$PORT" >/dev/null 2>&1 || true
   if ! wait_for_cdp "$PORT"; then
-    # Last resort: if something already listens and answers HTTP, continue.
-    if cdp_http_ready "$PORT"; then
-      printf 'CDP HTTP is up on %s; continuing with soft verification.\n' "$PORT" >&2
-    else
-      fail "Codex did not expose a loopback CDP endpoint on port $PORT within 45 seconds. See $APP_LOG and $APP_ERROR_LOG"
-    fi
+    fail "Codex did not expose a verified loopback CDP endpoint on port $PORT within 45 seconds. See $APP_LOG and $APP_ERROR_LOG"
   fi
 fi
 
